@@ -1,0 +1,12 @@
+.env
+.env.local
+__pycache__/
+*.py[cod]
+*.egg-info/
+.vscode/
+.idea/
+.pytest_cache/
+.coverage
+venv/
+docs/BLUEPRINT.md
+docs/MASTER_TASK_LIST.md

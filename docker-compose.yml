@@ -1,0 +1,141 @@
+# ============================================================================
+# Payment Failure Auto-Responder — Docker Compose Configuration
+# Phase 1: Project Setup
+# Reference: Blueprint Part 11 (Deployment)
+# 
+# Services:
+# 1. PostgreSQL 14 — Database for payment recovery state
+# 2. Redis 7 — Queue and cache layer
+# 3. API — FastAPI application
+#
+# Usage:
+#   docker-compose up          # Start all services
+#   docker-compose down        # Stop all services
+#   docker-compose logs -f api # Follow API logs
+# ============================================================================
+
+version: '3.8'
+
+services:
+  # ========================================================================
+  # PostgreSQL Database
+  # ========================================================================
+  postgres:
+    image: postgres:14-alpine
+    container_name: payment_recovery_db
+    environment:
+      POSTGRES_DB: payment_recovery
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      # Mount SQL migrations
+      - ./migrations:/docker-entrypoint-initdb.d
+      # Persist database data
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - payment_recovery_network
+    
+  # ========================================================================
+  # Redis Cache & Queue
+  # ========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: payment_recovery_cache
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - payment_recovery_network
+  
+  # ========================================================================
+  # FastAPI Application
+  # ========================================================================
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: payment_recovery_api
+    ports:
+      - "8000:8000"
+    environment:
+      # Database
+      DATABASE_URL: postgresql://postgres:dev_password@postgres:5432/payment_recovery
+      
+      # Redis
+      REDIS_URL: redis://redis:6379
+      
+      # API
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      
+      # Razorpay (test mode)
+      # CRITICAL: These must be set before running
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-rzp_test_placeholder}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-placeholder_secret}
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-placeholder_webhook_secret}
+      
+      # SMS Provider (development)
+      SMS_PROVIDER: ${SMS_PROVIDER:-twilio}
+      SMS_ACCOUNT_SID: ${SMS_ACCOUNT_SID:-}
+      SMS_AUTH_TOKEN: ${SMS_AUTH_TOKEN:-}
+      SMS_FROM_NUMBER: ${SMS_FROM_NUMBER:-}
+      
+      # Logging
+      LOG_LEVEL: DEBUG
+      
+      # Features
+      ENABLE_AUTO_RETRY: "true"
+      ENABLE_SMS: "true"
+      ENABLE_INSTALLMENTS: "true"
+      
+      # Safety limits
+      MAX_RETRIES_GLOBAL: 5
+      MAX_SMS_PER_CUSTOMER_PER_DAY: 3
+    
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    
+    volumes:
+      # Mount source code for hot-reload during development
+      - ./:/app
+    
+    networks:
+      - payment_recovery_network
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+# ============================================================================
+# Volumes (for persistent data)
+# ============================================================================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+# ============================================================================
+# Networks
+# ============================================================================
+networks:
+  payment_recovery_network:
+    driver: bridge

@@ -11,6 +11,7 @@ uvicorn[standard]==0.24.0
 # Database
 psycopg2-binary==2.9.9  # PostgreSQL adapter
 sqlalchemy==2.0.23  # ORM
+alembic==1.13.1
 
 # Redis (queues, caching, idempotency)
 redis==5.0.1

@@ -106,26 +106,27 @@
 
 ### 24-43: Database Initialization & CRUD Operations
 
-- [ ] **Task 24** — Alembic migration setup (optional, if versioning needed)
-  - Subtasks: Set up migration tracking | Status: Not started
+- [x] **Task 24** — Alembic migration setup (optional, if versioning needed)
+  - Date: 2026-09-17 | Alembic tracks existing SQL; offline upgrade/downgrade and configuration tests: 5 passed; flake8/mypy passed.
+  - PostgreSQL integration pending: Docker daemon unavailable. DATABASE_URL must be explicitly set. Fresh databases: alembic upgrade head. Existing Docker-initialized databases: verify schema matches 001_initial_schema.sql before alembic stamp 001_initial_schema; do not rerun initial DDL.
 
-- [ ] **Task 25** — SQLAlchemy declarative base setup
-  - Subtasks: Create Base class | Status: Not started
+- [x] **Task 25** — SQLAlchemy declarative base setup
+  - Date: 2026-09-17 | Typed SQLAlchemy 2 DeclarativeBase in src/database/models.py; 6 tests passed; flake8/mypy passed. No runtime schema creation.
 
-- [ ] **Task 26** — PaymentFailureEvent ORM model
-  - Subtasks: Map to payment_failure_event table | Status: Not started
+- [x] **Task 26** — PaymentFailureEvent ORM model
+  - Date: 2026-09-17 | All 17 columns, defaults, constraints and indexes mapped to SQL migration (not the illustrative snippet); 7 tests and flake8/mypy passed. PostgreSQL execution pending daemon availability.
 
-- [ ] **Task 27** — FailureRecoveryAction ORM model
-  - Subtasks: Map to failure_recovery_action table | Status: Not started
+- [x] **Task 27** — FailureRecoveryAction ORM model
+  - Date: 2026-09-17 | All 15 columns incl. FK cascade, idempotency unique, JSONB config/result and checks mapped; 8 tests and flake8/mypy passed.
 
-- [ ] **Task 28** — AuditLog ORM model
-  - Subtasks: Map to audit_log table | Status: Not started
+- [x] **Task 28** — AuditLog ORM model
+  - Date: 2026-09-17 | All 9 columns incl. SET NULL FKs, JSONB details and event-type check mapped; 9 tests and flake8/mypy passed.
 
-- [ ] **Task 29** — All other ORM models (merchant_policy, customer_record, etc.)
-  - Subtasks: 7 more models | Status: Not started
+- [x] **Task 29** — All other ORM models (merchant_policy, customer_record, etc.)
+  - Date: 2026-09-17 | All 7 remaining tables mapped (IdempotencyKey, MerchantPolicy, CustomerRecord, SMSDeliveryTracking, OutcomeRecord, SupportEscalation, DiagnosisCache); 10/10 tables verified against SQL schema; 16 tests and flake8/mypy passed.
 
-- [ ] **Task 30** — Database connection pooling
-  - Subtasks: SQLAlchemy engine + session factory | Status: Not started
+- [x] **Task 30** — Database connection pooling
+  - Date: 2026-09-17 | src/database/connection.py: pooled engine (pool_size 10, overflow 20, pre-ping, recycle 30 min), lazy init, session factory, get_db(), dispose; 18 tests and flake8/mypy passed. PostgreSQL URL enforced; no connect on import.
 
 - [ ] **Task 31** — CRUD: insert_payment_failure_event()
   - Subtasks: Take PaymentPayload, insert, return failure_id | Status: Not started

@@ -6,6 +6,7 @@ __pycache__/
 .vscode/
 .idea/
 .pytest_cache/
+.mypy_cache/
 .coverage
 venv/
 docs/BLUEPRINT.md

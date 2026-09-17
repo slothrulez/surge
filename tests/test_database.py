@@ -17,6 +17,12 @@ from sqlalchemy.schema import CreateTable
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase
 
+from collections.abc import Iterator
+from typing import Any
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import OperationalError
+
+from models import AcquirerData, PaymentMethodType, PaymentPayload
 from src.database import queries
 from src.database import connection
 from src.database.models import Base
@@ -165,7 +171,7 @@ def test_migration_rejects_non_postgresql(
 
 
 @pytest.fixture()
-def db_session():
+def db_session(monkeypatch: pytest.MonkeyPatch) -> Iterator[Session]:
     """Provide a transactional SQLite session with full ORM schema.
 
     SQLite cannot render PostgreSQL's JSONB, so the test dialect maps
@@ -173,8 +179,11 @@ def db_session():
     """
     from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
 
-    SQLiteTypeCompiler.visit_JSONB = SQLiteTypeCompiler.visit_JSON
-    engine = create_engine("sqlite://")
+    monkeypatch.setattr(
+        SQLiteTypeCompiler, "visit_JSONB",
+        SQLiteTypeCompiler.visit_JSON, raising=False,
+    )
+    engine = create_engine("sqlite://", hide_parameters=True)
     Base.metadata.create_all(engine)
     factory = sessionmaker(
         bind=engine, autoflush=False, expire_on_commit=False
@@ -187,18 +196,17 @@ def db_session():
         engine.dispose()
 
 
-def _sample_failure_kwargs() -> dict:
-    """Build valid insert_payment_failure_event arguments."""
+def _sample_failure_kwargs() -> dict[str, Any]:
     return {
-        "payment_id": "pay_test_1",
-        "order_id": "order_test_1",
+        "payment_payload": PaymentPayload(
+            id="pay_test_1", order_id="order_test_1", amount=100000,
+            currency="INR", status="failed", method=PaymentMethodType.CARD,
+            description="Test payment", error_code="BAD_REQUEST_ERROR",
+            error_description="Card has expired", acquirer_data=AcquirerData(),
+            email="test@example.test", contact="+910000000000",
+        ),
         "merchant_id": "merchant_1",
         "customer_id": "customer_1",
-        "amount": 100000,
-        "currency": "INR",
-        "error_code": "BAD_REQUEST_ERROR",
-        "error_description": "Card has expired",
-        "payment_method": "card",
         "webhook_event_id": "evt_test_1",
         "detected_at": datetime(2026, 9, 17, 12, 0, 0),
     }
@@ -215,6 +223,81 @@ def _sample_action_kwargs(failure_id) -> dict:
         "idempotency_key": "key_sms_test_1",
         "config": {"template": "card_update"},
     }
+
+
+def test_recovery_action_rejects_mismatched_failure(
+    db_session: Session,
+) -> None:
+    with queries.transaction(db_session):
+        failure_id = queries.insert_payment_failure_event(
+            db_session, **_sample_failure_kwargs()
+        )
+    kwargs = _sample_action_kwargs(failure_id)
+    kwargs["payment_id"] = "pay_other"
+    with pytest.raises(ValueError, match="do not match"):
+        queries.insert_recovery_action(db_session, **kwargs)
+    assert db_session.query(queries.FailureRecoveryAction).count() == 0
+
+
+def test_recovery_action_rejects_unknown_action_type(
+    db_session: Session,
+) -> None:
+    with queries.transaction(db_session):
+        failure_id = queries.insert_payment_failure_event(
+            db_session, **_sample_failure_kwargs()
+        )
+    kwargs = _sample_action_kwargs(failure_id)
+    kwargs["action_type"] = "NOT_A_TYPE"
+    with pytest.raises(ValueError):
+        queries.insert_recovery_action(db_session, **kwargs)
+
+
+def test_recovery_action_rejects_unknown_failure(
+    db_session: Session,
+) -> None:
+    kwargs = _sample_action_kwargs(
+        "00000000-0000-0000-0000-000000000000"
+    )
+    with pytest.raises(ValueError, match="Failure not found"):
+        queries.insert_recovery_action(db_session, **kwargs)
+
+
+def test_recovery_action_rejects_missing_or_long_key(
+    db_session: Session,
+) -> None:
+    with queries.transaction(db_session):
+        failure_id = queries.insert_payment_failure_event(
+            db_session, **_sample_failure_kwargs()
+        )
+    kwargs = _sample_action_kwargs(failure_id)
+    kwargs["idempotency_key"] = ""
+    with pytest.raises(ValueError):
+        queries.insert_recovery_action(db_session, **kwargs)
+    kwargs["idempotency_key"] = "x" * 256
+    with pytest.raises(ValueError):
+        queries.insert_recovery_action(db_session, **kwargs)
+
+
+def test_recovery_action_audit_failure_rolls_back(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with queries.transaction(db_session):
+        failure_id = queries.insert_payment_failure_event(
+            db_session, **_sample_failure_kwargs()
+        )
+
+    def fail_audit(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr(queries, "log_audit_event", fail_audit)
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        queries.insert_recovery_action(
+            db_session, **_sample_action_kwargs(failure_id)
+        )
+    db_session.commit()
+    assert db_session.query(queries.FailureRecoveryAction).count() == 0
+    assert db_session.query(queries.IdempotencyKey).count() == 0
+    assert db_session.query(queries.AuditLog).count() == 1
 
 
 def test_insert_payment_failure_event_audits(db_session) -> None:
@@ -248,6 +331,95 @@ def test_insert_payment_failure_event_duplicate_rejected(
             )
 
 
+@pytest.mark.parametrize("duplicate_field", ["payment_id", "webhook_event_id"])
+def test_failure_unique_keys_independently(
+    db_session: Session, duplicate_field: str,
+) -> None:
+    with queries.transaction(db_session):
+        queries.insert_payment_failure_event(
+            db_session, **_sample_failure_kwargs()
+        )
+    kwargs = _sample_failure_kwargs()
+    if duplicate_field == "payment_id":
+        kwargs["webhook_event_id"] = "evt_other"
+    else:
+        kwargs["payment_payload"].id = "pay_other"
+    with pytest.raises(queries.DuplicateRecordError):
+        with queries.transaction(db_session):
+            queries.insert_payment_failure_event(db_session, **kwargs)
+    assert db_session.query(queries.PaymentFailureEvent).count() == 1
+    assert db_session.query(queries.AuditLog).count() == 1
+
+
+def test_invalid_amount_is_not_reported_as_duplicate(
+    db_session: Session,
+) -> None:
+    kwargs = _sample_failure_kwargs()
+    kwargs["payment_payload"].amount = 0
+    with pytest.raises(queries.DatabaseError) as error:
+        with queries.transaction(db_session):
+            queries.insert_payment_failure_event(db_session, **kwargs)
+    assert not isinstance(error.value, queries.DuplicateRecordError)
+    assert db_session.query(queries.PaymentFailureEvent).count() == 0
+    assert db_session.query(queries.AuditLog).count() == 0
+
+
+def test_failure_audit_error_rolls_back_and_hides_parameters(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def fail_audit(*args: Any, **kwargs: Any) -> None:
+        raise OperationalError("INSERT", {"token": "private-token"},
+                               RuntimeError("private-token"))
+
+    monkeypatch.setattr(queries, "log_audit_event", fail_audit)
+    with pytest.raises(queries.DatabaseError) as error:
+        queries.insert_payment_failure_event(
+            db_session, **_sample_failure_kwargs()
+        )
+    db_session.commit()
+    assert "private-token" not in str(error.value)
+    assert "private-token" not in caplog.text
+    assert error.value.__suppress_context__
+    assert db_session.query(queries.PaymentFailureEvent).count() == 0
+    assert db_session.query(queries.AuditLog).count() == 0
+
+
+def test_failure_lookup_missing_and_invalid_ids(db_session: Session) -> None:
+    assert queries.get_payment_failure_by_id(
+        db_session, "00000000-0000-0000-0000-000000000000"
+    ) is None
+    with pytest.raises(ValueError):
+        queries.get_payment_failure_by_id(db_session, "invalid-uuid")
+
+
+def test_failure_lookup_string_uuid(db_session: Session) -> None:
+    with queries.transaction(db_session):
+        identifier = queries.insert_payment_failure_event(
+            db_session, **_sample_failure_kwargs()
+        )
+    result = queries.get_payment_failure_by_id(db_session, str(identifier))
+    assert result is not None
+    assert result.failure_id == identifier
+
+
+def test_failure_lookup_database_error(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def fail_query(*args: Any, **kwargs: Any) -> None:
+        raise OperationalError("SELECT", {}, RuntimeError("private-token"))
+
+    monkeypatch.setattr(db_session, "scalar", fail_query)
+    with pytest.raises(queries.DatabaseError) as error:
+        queries.get_payment_failure_by_id(
+            db_session, "00000000-0000-0000-0000-000000000000"
+        )
+    assert "private-token" not in str(error.value)
+    assert "private-token" not in caplog.text
+    assert error.value.__suppress_context__
+
+
 def test_update_failure_status_audits_transition(db_session) -> None:
     """Status changes record from/to context in the audit log."""
     with queries.transaction(db_session):
@@ -256,7 +428,7 @@ def test_update_failure_status_audits_transition(db_session) -> None:
         )
         queries.update_failure_status(
             db_session, failure_id, "DIAGNOSED", "DIAGNOSIS_ENGINE",
-            "Card expired mapped",
+            "Card expired mapped", idempotency_key="status-diagnosed",
         )
     failure = queries.get_payment_failure_by_id(db_session, failure_id)
     assert failure is not None
@@ -270,7 +442,113 @@ def test_update_failure_status_audits_transition(db_session) -> None:
             queries.update_failure_status(
                 db_session, "00000000-0000-0000-0000-000000000000",
                 "CLOSED", "SYSTEM", "unknown id",
+                idempotency_key="missing-status",
             )
+
+
+@pytest.mark.parametrize("status,event_type", [
+    ("DIAGNOSED", "DIAGNOSIS_COMPLETE"),
+    ("POLICY_CHECK_PASSED", "POLICY_CHECK_PASSED"),
+    ("ACTION_FAILED", "ACTION_FAILED"),
+    ("CLOSED", "OUTCOME_RECORDED"),
+])
+def test_status_update_event_and_replay(
+    db_session: Session, status: str, event_type: str,
+) -> None:
+    with queries.transaction(db_session):
+        identifier = queries.insert_payment_failure_event(
+            db_session, **_sample_failure_kwargs()
+        )
+        queries.update_failure_status(
+            db_session, identifier, status, "SYSTEM", "test",
+            idempotency_key="status-key",
+        )
+    with queries.transaction(db_session):
+        queries.update_failure_status(
+            db_session, identifier, status, "SYSTEM", "test",
+            idempotency_key="status-key",
+        )
+    events = db_session.query(queries.AuditLog).all()
+    assert len(events) == 2
+    assert events[1].event_type == event_type
+    assert events[1].details["to"] == status
+    assert db_session.query(queries.IdempotencyKey).count() == 1
+    with pytest.raises(ValueError, match="conflicts"):
+        queries.update_failure_status(
+            db_session, identifier, "ESCALATED", "SYSTEM", "changed",
+            idempotency_key="status-key",
+        )
+    failure = queries.get_payment_failure_by_id(db_session, identifier)
+    assert failure is not None
+    assert failure.status == status
+
+
+def test_status_audit_failure_rolls_back_key_and_status(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with queries.transaction(db_session):
+        identifier = queries.insert_payment_failure_event(
+            db_session, **_sample_failure_kwargs()
+        )
+
+    def fail_audit(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr(queries, "log_audit_event", fail_audit)
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        queries.update_failure_status(
+            db_session, identifier, "DIAGNOSED", "SYSTEM", "test",
+            idempotency_key="status-key",
+        )
+    db_session.commit()
+    failure = queries.get_payment_failure_by_id(db_session, identifier)
+    assert failure is not None
+    assert failure.status == "PENDING"
+    assert db_session.query(queries.IdempotencyKey).count() == 0
+    assert db_session.query(queries.AuditLog).count() == 1
+
+
+def test_status_replay_does_not_revert_later_update(
+    db_session: Session,
+) -> None:
+    with queries.transaction(db_session):
+        identifier = queries.insert_payment_failure_event(
+            db_session, **_sample_failure_kwargs()
+        )
+        queries.update_failure_status(
+            db_session, identifier, "DIAGNOSED", "SYSTEM", "first",
+            idempotency_key="first",
+        )
+        queries.update_failure_status(
+            db_session, identifier, "POLICY_CHECK_PASSED", "SYSTEM", "next",
+            idempotency_key="next",
+        )
+    with queries.transaction(db_session):
+        queries.update_failure_status(
+            db_session, identifier, "DIAGNOSED", "SYSTEM", "first",
+            idempotency_key="first",
+        )
+    failure = queries.get_payment_failure_by_id(db_session, identifier)
+    assert failure is not None
+    assert failure.status == "POLICY_CHECK_PASSED"
+    assert db_session.query(queries.AuditLog).count() == 3
+
+
+def test_action_listing_error_sanitized(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def fail_query(*args: Any, **kwargs: Any) -> None:
+        raise OperationalError("SELECT", {}, RuntimeError("private-token"))
+
+    monkeypatch.setattr(db_session, "scalars", fail_query)
+    with pytest.raises(queries.DatabaseError) as error:
+        queries.get_recovery_actions_for_failure(
+            db_session, "00000000-0000-0000-0000-000000000000"
+        )
+    assert "private-token" not in str(error.value)
+    assert "private-token" not in caplog.text
+    assert error.value.__suppress_context__
 
 
 def test_insert_recovery_action_idempotent(db_session) -> None:
@@ -313,6 +591,21 @@ def test_idempotency_key_roundtrip_and_expiry(db_session) -> None:
     assert queries.check_idempotency(db_session, "op_1") is None
 
 
+def test_check_idempotency_database_error_sanitized(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def fail_query(*args: Any, **kwargs: Any) -> None:
+        raise OperationalError("SELECT", {}, RuntimeError("private-token"))
+
+    monkeypatch.setattr(db_session, "scalar", fail_query)
+    with pytest.raises(queries.DatabaseError) as error:
+        queries.check_idempotency(db_session, "op_1")
+    assert "private-token" not in str(error.value)
+    assert "private-token" not in caplog.text
+    assert error.value.__suppress_context__
+
+
 def test_log_audit_event_stores_full_context(db_session) -> None:
     """Audit entries persist actor, details and optional relations."""
     with queries.transaction(db_session):
@@ -324,6 +617,37 @@ def test_log_audit_event_stores_full_context(db_session) -> None:
     assert entry.audit_id == audit_id
     assert entry.details == {"k": "v"}
     assert entry.actor == "DETECTION_ENGINE"
+
+
+def test_log_audit_event_rejects_unknown_type_and_actor(
+    db_session: Session,
+) -> None:
+    with pytest.raises(ValueError, match="event_type"):
+        queries.log_audit_event(
+            db_session, "pay_test_1", "merchant_1",
+            "NOT_AN_EVENT", "SYSTEM", {},
+        )
+    with pytest.raises(ValueError, match="actor"):
+        queries.log_audit_event(
+            db_session, "pay_test_1", "merchant_1",
+            "FAILURE_DETECTED", "SUPERUSER", {},
+        )
+    assert db_session.query(queries.AuditLog).count() == 0
+
+
+def test_merchant_policy_lookup_error_sanitized(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def fail_query(*args: Any, **kwargs: Any) -> None:
+        raise OperationalError("SELECT", {}, RuntimeError("private-token"))
+
+    monkeypatch.setattr(db_session, "scalar", fail_query)
+    with pytest.raises(queries.DatabaseError) as error:
+        queries.get_merchant_policy(db_session, "merchant_1")
+    assert "private-token" not in str(error.value)
+    assert "private-token" not in caplog.text
+    assert error.value.__suppress_context__
 
 
 def test_merchant_policy_ensure_and_update(db_session) -> None:
@@ -351,7 +675,8 @@ def test_merchant_policy_ensure_and_update(db_session) -> None:
         assert policy.policy_id == policy_again.policy_id
         updated = queries.update_merchant_policy(
             db_session, "merchant_1",
-            {"daily_sms_limit_per_customer": 1}, "ADMIN",
+            {"daily_sms_limit_per_customer": 1}, "SYSTEM",
+            idempotency_key="policy-update-1",
         )
     assert updated.daily_sms_limit_per_customer == 1
     assert queries.get_merchant_policy(db_session, "merchant_1") is not None
@@ -363,11 +688,83 @@ def test_merchant_policy_ensure_and_update(db_session) -> None:
     assert update_entries[0].details["policy_update"]["before"][
         "daily_sms_limit_per_customer"
     ] == 3
+    with pytest.raises(ValueError, match="Unknown policy column"):
+        with queries.transaction(db_session):
+            queries.update_merchant_policy(
+                db_session, "merchant_1", {"bogus_column": 1}, "SYSTEM",
+                idempotency_key="invalid-policy",
+            )
+    fetched = queries.get_merchant_policy(db_session, "merchant_1")
+    assert fetched is not None
+    assert fetched.daily_sms_limit_per_customer == 1
     with pytest.raises(ValueError, match="not found"):
         with queries.transaction(db_session):
             queries.update_merchant_policy(
-                db_session, "merchant_missing", {}, "ADMIN"
+                db_session, "merchant_missing", {}, "SYSTEM",
+                idempotency_key="missing-policy",
             )
+
+
+def test_policy_update_replay_and_rollback(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with queries.transaction(db_session):
+        queries.ensure_merchant_policy(db_session, "merchant_1", {
+            "allowed_failure_types": "TIMEOUT",
+            "retry_delays_seconds": "[60]",
+        })
+        queries.update_merchant_policy(
+            db_session, "merchant_1", {"max_retries": 2}, "SYSTEM",
+            idempotency_key="policy-first",
+        )
+    with queries.transaction(db_session):
+        queries.update_merchant_policy(
+            db_session, "merchant_1", {"max_retries": 2}, "SYSTEM",
+            idempotency_key="policy-first",
+        )
+    assert db_session.query(queries.AuditLog).count() == 1
+    with pytest.raises(ValueError, match="conflicts"):
+        queries.update_merchant_policy(
+            db_session, "merchant_1", {"max_retries": 3}, "SYSTEM",
+            idempotency_key="policy-first",
+        )
+    for field in ("policy_id", "merchant_id", "created_at", "updated_at"):
+        with pytest.raises(ValueError, match="immutable"):
+            queries.update_merchant_policy(
+                db_session, "merchant_1", {field: "changed"}, "SYSTEM",
+                idempotency_key="policy-invalid",
+            )
+
+    def fail_audit(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr(queries, "log_audit_event", fail_audit)
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        queries.update_merchant_policy(
+            db_session, "merchant_1", {"max_retries": 4}, "SYSTEM",
+            idempotency_key="policy-failed",
+        )
+    db_session.commit()
+    policy = queries.get_merchant_policy(db_session, "merchant_1")
+    assert policy is not None
+    assert policy.max_retries == 2
+    assert db_session.get(queries.IdempotencyKey, "policy-failed") is None
+
+
+def test_customer_lookup_missing_and_error(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    assert queries.get_customer_record(db_session, "missing") is None
+
+    def fail_query(*args: Any, **kwargs: Any) -> None:
+        raise OperationalError("SELECT", {}, RuntimeError("private-token"))
+
+    monkeypatch.setattr(db_session, "scalar", fail_query)
+    with pytest.raises(queries.DatabaseError) as error:
+        queries.get_customer_record(db_session, "customer_1")
+    assert "private-token" not in str(error.value)
+    assert "private-token" not in caplog.text
 
 
 def test_customer_record_ensure_and_fetch(db_session) -> None:
@@ -403,6 +800,7 @@ def test_sms_outcome_escalation_flow(db_session) -> None:
         outcome_id = queries.record_outcome(
             db_session, "pay_test_1", failure_id, "SMS_SENT", True,
             {"sms_id": str(sms_id)}, action_id=action_id,
+            idempotency_key="sms-outcome",
         )
         escalation_id = queries.create_support_escalation(
             db_session, failure_id, action_id, "pay_test_1",
@@ -410,7 +808,7 @@ def test_sms_outcome_escalation_flow(db_session) -> None:
         )
     failure = queries.get_payment_failure_by_id(db_session, failure_id)
     assert failure is not None
-    assert failure.status == "ACTION_SUCCESS"
+    assert failure.status == "PENDING"
     outcome = db_session.query(queries.OutcomeRecord).one()
     assert outcome.outcome_id == outcome_id
     assert outcome.success is True
@@ -423,9 +821,66 @@ def test_sms_outcome_escalation_flow(db_session) -> None:
         entry.event_type for entry in db_session.query(queries.AuditLog)
     ]
     assert event_types == [
-        "FAILURE_DETECTED", "ACTION_EXECUTING", "OUTCOME_RECORDED",
-        "ESCALATED",
+        "FAILURE_DETECTED", "STRATEGY_SELECTED", "OUTCOME_RECORDED",
+        "OUTCOME_RECORDED", "ESCALATED",
     ]
+
+
+def test_sms_record_encodes_audit_ref_and_sms_metadata(
+    db_session: Session,
+) -> None:
+    with queries.transaction(db_session):
+        failure_id = queries.insert_payment_failure_event(
+            db_session, **_sample_failure_kwargs()
+        )
+        action_id = queries.insert_recovery_action(
+            db_session, **_sample_action_kwargs(failure_id)
+        )
+        sms_id = queries.record_sms_delivery(
+            db_session, action_id, "pay_test_1", "customer_1", "merchant_1",
+            "private-phone", "private-message", "test",
+        )
+    audit = db_session.query(queries.AuditLog).filter_by(
+        event_type="OUTCOME_RECORDED"
+    ).one()
+    assert audit.action_id == action_id
+    assert audit.failure_id == failure_id
+    assert audit.details == {
+        "operation": "SMS_DELIVERY_RECORDED",
+        "sms_id": str(sms_id), "status": "SENT",
+    }
+    assert "private-phone" not in str(audit.details)
+    assert "private-message" not in str(audit.details)
+
+
+def test_sms_record_validation_and_audit_rollback(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with queries.transaction(db_session):
+        failure_id = queries.insert_payment_failure_event(
+            db_session, **_sample_failure_kwargs()
+        )
+        action_id = queries.insert_recovery_action(
+            db_session, **_sample_action_kwargs(failure_id)
+        )
+    with pytest.raises(ValueError, match="do not match"):
+        queries.record_sms_delivery(
+            db_session, action_id, "wrong", "customer_1", "merchant_1",
+            "private-phone", "private-message", "test",
+        )
+
+    def fail_audit(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr(queries, "log_audit_event", fail_audit)
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        queries.record_sms_delivery(
+            db_session, action_id, "pay_test_1", "customer_1", "merchant_1",
+            "private-phone", "private-message", "test",
+        )
+    db_session.commit()
+    assert db_session.query(queries.SMSDeliveryTracking).count() == 0
+    assert db_session.query(queries.AuditLog).count() == 2
 
 
 def test_record_outcome_failure_marks_action_failed(db_session) -> None:
@@ -437,6 +892,7 @@ def test_record_outcome_failure_marks_action_failed(db_session) -> None:
         queries.record_outcome(
             db_session, "pay_test_1", failure_id, "RETRY_FAILED", False,
             {"reason": "gateway declined"},
+            idempotency_key="retry-failed", new_status="ACTION_FAILED",
         )
     failure = queries.get_payment_failure_by_id(db_session, failure_id)
     assert failure is not None
@@ -446,8 +902,54 @@ def test_record_outcome_failure_marks_action_failed(db_session) -> None:
             queries.record_outcome(
                 db_session, "pay_missing",
                 "00000000-0000-0000-0000-000000000000",
-                "RETRY_FAILED", False, {},
+                "RETRY_FAILED", False, {}, idempotency_key="missing-outcome",
             )
+
+
+def test_outcome_replay_conflict_and_rollback(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with queries.transaction(db_session):
+        failure_id = queries.insert_payment_failure_event(
+            db_session, **_sample_failure_kwargs()
+        )
+        outcome_id = queries.record_outcome(
+            db_session, "pay_test_1", failure_id, "RETRY_SUCCESS", True, {},
+            idempotency_key="outcome", new_status="ACTION_SUCCESS",
+        )
+    with queries.transaction(db_session):
+        assert queries.record_outcome(
+            db_session, "pay_test_1", failure_id, "RETRY_SUCCESS", True, {},
+            idempotency_key="outcome", new_status="ACTION_SUCCESS",
+        ) == outcome_id
+    assert db_session.query(queries.OutcomeRecord).count() == 1
+    assert db_session.query(queries.AuditLog).count() == 2
+    with pytest.raises(ValueError, match="conflicts"):
+        queries.record_outcome(
+            db_session, "pay_test_1", failure_id, "RETRY_FAILED", False, {},
+            idempotency_key="outcome", new_status="ACTION_FAILED",
+        )
+    with pytest.raises(ValueError, match="does not match"):
+        queries.record_outcome(
+            db_session, "wrong", failure_id, "SMS_SENT", True, {},
+            idempotency_key="wrong-payment",
+        )
+
+    def fail_audit(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr(queries, "log_audit_event", fail_audit)
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        queries.record_outcome(
+            db_session, "pay_test_1", failure_id, "RETRY_FAILED", False, {},
+            idempotency_key="failed-write", new_status="ACTION_FAILED",
+        )
+    db_session.commit()
+    failure = queries.get_payment_failure_by_id(db_session, failure_id)
+    assert failure is not None
+    assert failure.status == "ACTION_SUCCESS"
+    assert db_session.query(queries.OutcomeRecord).count() == 1
+    assert db_session.get(queries.IdempotencyKey, "failed-write") is None
 
 
 def test_diagnosis_cache_roundtrip_and_expiry(db_session) -> None:

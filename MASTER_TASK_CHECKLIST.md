@@ -102,7 +102,7 @@
 
 ---
 
-## PHASE 2: Database Layer (20 tasks) 📝 READY TO START
+## PHASE 2: Database Layer (20 tasks) ✅ COMPLETE
 
 ### 24-43: Database Initialization & CRUD Operations
 
@@ -128,46 +128,46 @@
 - [x] **Task 30** — Database connection pooling
   - Date: 2026-09-17 | src/database/connection.py: pooled engine (pool_size 10, overflow 20, pre-ping, recycle 30 min), lazy init, session factory, get_db(), dispose; 18 tests and flake8/mypy passed. PostgreSQL URL enforced; no connect on import.
 
-- [ ] **Task 31** — CRUD: insert_payment_failure_event()
-  - Subtasks: Take PaymentPayload, insert, return failure_id | Status: Not started
+- [x] **Task 31** — CRUD: insert_payment_failure_event()
+  - Date: 2026-09-17 | Accepts PaymentPayload plus explicit merchant/customer/webhook IDs; inserts failure and audit in caller transaction, returns UUID. Independent duplicate keys, invalid amount, audit rollback and sanitized errors tested. 34 tests passed; flake8/mypy passed. PostgreSQL integration remains pending.
 
-- [ ] **Task 32** — CRUD: get_payment_failure_by_id()
-  - Subtasks: Query + return PaymentFailureEvent | Status: Not started
+- [x] **Task 32** — CRUD: get_payment_failure_by_id()
+  - Date: 2026-09-17 | UUID/string lookup, missing rows, invalid UUIDs and sanitized database errors verified; returns existing ORM PaymentFailureEvent (no equivalent Phase 0 Pydantic model exists). 37 tests passed; flake8/mypy passed.
 
-- [ ] **Task 33** — CRUD: update_failure_status()
-  - Subtasks: Change status in DB + log audit | Status: Not started
+- [x] **Task 33** — CRUD: update_failure_status()
+  - Date: 2026-09-17 | Validates RecoveryStatus; requires operation idempotency_key, locks failure row, rejects conflicting key reuse, preserves later status on replay, writes matching audit event atomically. 43 tests passed; flake8/mypy passed. PostgreSQL concurrency execution still pending.
 
-- [ ] **Task 34** — CRUD: insert_recovery_action()
-  - Subtasks: Create action record + idempotency check | Status: Not started
+- [x] **Task 34** — CRUD: insert_recovery_action()
+  - Date: 2026-09-17 | Validates ActionType, requires idempotency key, verifies identifiers match parent failure, logs STRATEGY_SELECTED audit atomically; mismatches, unknown types, long keys and audit rollback tested. 48 tests passed; flake8/mypy passed.
 
-- [ ] **Task 35** — CRUD: get_recovery_actions_for_failure()
-  - Subtasks: Query actions for a failure | Status: Not started
+- [x] **Task 35** — CRUD: get_recovery_actions_for_failure()
+  - Date: 2026-09-17 | Single ordered query per failure (no N+1); invalid UUIDs rejected with ValueError; database failures sanitized to typed DatabaseError. 49 tests passed; flake8/mypy passed.
 
-- [ ] **Task 36** — CRUD: log_audit_event()
-  - Subtasks: Insert into audit_log with full context | Status: Not started
+- [x] **Task 36** — CRUD: log_audit_event()
+  - Date: 2026-09-17 | Validates event_type/actor against config allowlists, persists full context with optional FKs, sanitizes DB errors. All src/test actor and event strings cross-checked against config. 50 tests passed; flake8/mypy passed.
 
-- [ ] **Task 37** — CRUD: check_idempotency()
-  - Subtasks: Query idempotency_key table | Status: Not started
+- [x] **Task 37** — CRUD: check_idempotency()
+  - Date: 2026-09-17 | Returns stored result, treats expired entries as unseen; lookup errors sanitized, recording rolls back on failure. 51 tests passed; flake8/mypy passed.
 
-- [ ] **Task 38** — CRUD: get_merchant_policy()
-  - Subtasks: Query merchant_policy by merchant_id | Status: Not started
+- [x] **Task 38** — CRUD: get_merchant_policy()
+  - Date: 2026-09-17 | Merchant ID lookup returns policy or None; database errors sanitized. 52 tests passed; flake8/mypy passed.
 
-- [ ] **Task 39** — CRUD: update_merchant_policy()
-  - Subtasks: Update policy, log audit | Status: Not started
+- [x] **Task 39** — CRUD: update_merchant_policy()
+  - Date: 2026-09-17 | Requires idempotency key, rejects conflicting replay and immutable/unknown columns, locks policy row and audits before/after atomically. Audit failure rolls back policy and key. 53 tests passed; flake8/mypy passed. PostgreSQL concurrency verification pending.
 
-- [ ] **Task 40** — CRUD: get_customer_record()
-  - Subtasks: Query customer history + risk score | Status: Not started
+- [x] **Task 40** — CRUD: get_customer_record()
+  - Date: 2026-09-17 | Returns stored customer history/risk flags or None; sanitized lookup errors tested. No inferred risk scoring in data access. 54 tests passed; flake8/mypy passed.
 
-- [ ] **Task 41** — CRUD: record_sms_delivery()
-  - Subtasks: Insert SMS delivery record | Status: Not started
+- [x] **Task 41** — CRUD: record_sms_delivery()
+  - Date: 2026-09-17 | Validates parent action identifiers, inserts SMS plus audit atomically, excludes phone/message from audit. Reference metadata and audit rollback tests pass. 56 tests passed; flake8/mypy passed.
 
-- [ ] **Task 42** — CRUD: record_outcome()
-  - Subtasks: Insert outcome record + update payment status | Status: Not started
+- [x] **Task 42** — CRUD: record_outcome()
+  - Date: 2026-09-17 | Caller supplies status change explicitly (SMS delivery no longer auto-marks recovery); validates payment/action identifiers, idempotent replay returns original outcome_id, conflicts rejected; status+outcome+audit+key atomic. 57 tests passed; flake8/mypy passed.
 
-- [ ] **Task 43** — Database transaction wrapper
-  - Subtasks: Context manager for ACID compliance | Status: Not started
+- [x] **Task 43** — Database transaction wrapper
+  - Date: 2026-09-17 | transaction() context manager: commit on success, rollback + re-raise on any failure, SQLAlchemy errors wrapped as sanitized DatabaseError. Rollback atomicity test passes (failure leaves no partial failure/audit rows). 57 tests passed; flake8/mypy passed.
 
-**Phase 2 Summary:** 0/20 complete | **Effort: 3-4 days**
+**Phase 2 Summary:** 20/20 complete ✅ | Completed 2026-09-17. 57 tests passed; flake8/mypy passed. Outstanding: PostgreSQL integration/concurrency verification (Docker daemon unavailable at last check) and 27 datetime.utcnow deprecation warnings to migrate to datetime.UTC.
 
 **Next:** After Phase 2, begin Phase 3
 
@@ -762,7 +762,7 @@
 ## Key Milestones
 
 - [x] Phase 0-1: Foundation (2026-08-29)
-- [ ] Phase 2: Database Layer (estimated 2024-01-22)
+- [x] Phase 2: Database Layer (2026-09-17)
 - [ ] Phase 3: Webhook Receiver (estimated 2024-01-29)
 - [ ] Phase 4-6: Core Processing (estimated 2024-02-19)
 - [ ] Phase 7-9: Actions & Outcomes (estimated 2024-03-12)

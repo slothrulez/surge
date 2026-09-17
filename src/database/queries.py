@@ -19,7 +19,10 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
-from config import IDEMPOTENCY_EXPIRY_SECONDS
+from config import (
+    AUDIT_LOG_ACTORS, AUDIT_LOG_EVENTS, IDEMPOTENCY_EXPIRY_SECONDS,
+)
+from models import ActionType, PaymentPayload, RecoveryStatus
 from src.database.models import (
     AuditLog, CustomerRecord, DiagnosisCache, FailureRecoveryAction,
     IdempotencyKey, MerchantPolicy, OutcomeRecord, PaymentFailureEvent,
@@ -73,11 +76,20 @@ def _flush_with_unique_handling(db: Session, entity: Any) -> None:
         db.flush()
     except IntegrityError as exc:
         db.rollback()
-        logger.warning(
-            "Uniqueness violation on %s: %s",
-            type(entity).__name__, type(exc).__name__,
+        duplicate = (
+            getattr(exc.orig, "pgcode", None) == "23505"
+            or getattr(exc.orig, "sqlstate", None) == "23505"
+            or getattr(exc.orig, "sqlite_errorname", None)
+            in {"SQLITE_CONSTRAINT_UNIQUE", "SQLITE_CONSTRAINT_PRIMARYKEY"}
         )
-        raise DuplicateRecordError(type(entity).__name__) from exc
+        logger.warning("Insert rejected: %s", type(exc).__name__)
+        if duplicate:
+            raise DuplicateRecordError(type(entity).__name__) from None
+        raise DatabaseError("Integrity constraint violation") from None
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("Database operation failed: %s", type(exc).__name__)
+        raise DatabaseError("Database operation failed") from None
 
 
 def log_audit_event(
@@ -108,6 +120,12 @@ def log_audit_event(
     Raises:
         DatabaseError: If the insert fails.
     """
+    if event_type not in AUDIT_LOG_EVENTS:
+        raise ValueError(
+            "event_type must be a configured AUDIT_LOG_EVENTS key"
+        )
+    if actor not in AUDIT_LOG_ACTORS:
+        raise ValueError("actor must be a configured AUDIT_LOG_ACTORS key")
     entry = AuditLog(
         payment_id=payment_id,
         merchant_id=merchant_id,
@@ -117,8 +135,16 @@ def log_audit_event(
         failure_id=UUID(str(failure_id)) if failure_id else None,
         action_id=UUID(str(action_id)) if action_id else None,
     )
-    db.add(entry)
-    _flush_with_unique_handling(db, entry)
+    try:
+        db.add(entry)
+        _flush_with_unique_handling(db, entry)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("Audit insert failed: %s", type(exc).__name__)
+        raise DatabaseError("Audit insert failed") from None
+    except Exception:
+        db.rollback()
+        raise
     return entry.audit_id
 
 
@@ -134,9 +160,14 @@ def check_idempotency(
     Returns:
         The recorded result of the first execution, else None.
     """
-    entry = db.scalar(
-        select(IdempotencyKey).where(IdempotencyKey.key == idempotency_key)
-    )
+    try:
+        entry = db.scalar(
+            select(IdempotencyKey).where(IdempotencyKey.key == idempotency_key)
+        )
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("Idempotency lookup failed: %s", type(exc).__name__)
+        raise DatabaseError("Idempotency lookup failed") from None
     if entry is None:
         return None
     if entry.expires_at <= datetime.utcnow():
@@ -173,37 +204,30 @@ def record_idempotency_key(
         created_at=now,
         expires_at=now + timedelta(seconds=IDEMPOTENCY_EXPIRY_SECONDS),
     )
-    db.add(entry)
-    _flush_with_unique_handling(db, entry)
+    try:
+        db.add(entry)
+        _flush_with_unique_handling(db, entry)
+    except Exception:
+        db.rollback()
+        raise
 
 
 def insert_payment_failure_event(
     db: Session,
-    payment_id: str,
-    order_id: str,
+    payment_payload: PaymentPayload,
+    detected_at: datetime,
+    *,
     merchant_id: str,
     customer_id: str,
-    amount: int,
-    currency: str,
-    error_code: str,
-    error_description: str,
-    payment_method: str,
     webhook_event_id: str,
-    detected_at: datetime,
 ) -> UUID:
     """Insert a payment_failure_event row and audit FAILURE_DETECTED.
 
     Args:
         db: Database session.
-        payment_id: Razorpay payment ID (unique).
-        order_id: Linked Razorpay order.
-        merchant_id: Merchant identifier.
-        customer_id: Customer identifier.
-        amount: Amount in paisa (must be positive).
-        currency: ISO currency code (default INR).
-        error_code: Razorpay error code.
-        error_description: Razorpay error description.
-        payment_method: Payment method used.
+        payment_payload: Validated Razorpay payment data.
+        merchant_id: Explicit merchant identifier, not inferred from notes.
+        customer_id: Explicit customer identifier, not inferred from contact.
         webhook_event_id: Razorpay event ID (deduplication key).
         detected_at: Failure detection time.
 
@@ -215,33 +239,40 @@ def insert_payment_failure_event(
         DatabaseError: If the insert fails.
     """
     failure = PaymentFailureEvent(
-        payment_id=payment_id,
-        order_id=order_id,
+        payment_id=payment_payload.id,
+        order_id=payment_payload.order_id,
         merchant_id=merchant_id,
         customer_id=customer_id,
-        amount=amount,
-        currency=currency,
-        error_code=error_code,
-        error_description=error_description,
-        payment_method=payment_method,
+        amount=payment_payload.amount,
+        currency=payment_payload.currency,
+        error_code=payment_payload.error_code,
+        error_description=payment_payload.error_description,
+        payment_method=payment_payload.method.value,
         webhook_event_id=webhook_event_id,
         detected_at=detected_at,
     )
-    db.add(failure)
-    _flush_with_unique_handling(db, failure)
-    log_audit_event(
-        db,
-        payment_id=payment_id,
-        merchant_id=merchant_id,
-        event_type="FAILURE_DETECTED",
-        actor="DETECTION_ENGINE",
-        details={
-            "error_code": error_code,
-            "error_description": error_description,
-            "webhook_event_id": webhook_event_id,
-        },
-        failure_id=failure.failure_id,
-    )
+    try:
+        db.add(failure)
+        _flush_with_unique_handling(db, failure)
+        log_audit_event(
+            db,
+            payment_id=payment_payload.id,
+            merchant_id=merchant_id,
+            event_type="FAILURE_DETECTED",
+            actor="DETECTION_ENGINE",
+            details={
+                "error_code": payment_payload.error_code,
+                "webhook_event_id": webhook_event_id,
+            },
+            failure_id=failure.failure_id,
+        )
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("Failure insertion failed: %s", type(exc).__name__)
+        raise DatabaseError("Failure insertion failed") from None
+    except Exception:
+        db.rollback()
+        raise
     return failure.failure_id
 
 
@@ -257,19 +288,27 @@ def get_payment_failure_by_id(
     Returns:
         The event or None if not found.
     """
-    return db.scalar(
-        select(PaymentFailureEvent).where(
-            PaymentFailureEvent.failure_id == UUID(str(failure_id))
+    identifier = UUID(str(failure_id))
+    try:
+        return db.scalar(
+            select(PaymentFailureEvent).where(
+                PaymentFailureEvent.failure_id == identifier
+            )
         )
-    )
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("Failure lookup failed: %s", type(exc).__name__)
+        raise DatabaseError("Failure lookup failed") from None
 
 
 def update_failure_status(
     db: Session,
     failure_id: UUID | str,
-    new_status: str,
+    new_status: RecoveryStatus | str,
     actor: str,
     reason: str,
+    *,
+    idempotency_key: str,
 ) -> None:
     """Update failure status and audit the transition in one transaction.
 
@@ -284,20 +323,57 @@ def update_failure_status(
         ValueError: If the failure does not exist.
         DatabaseError: If the update fails.
     """
-    failure = get_payment_failure_by_id(db, failure_id)
-    if failure is None:
-        raise ValueError(f"Failure not found: {failure_id}")
-    old_status = failure.status
-    failure.status = new_status
-    log_audit_event(
-        db,
-        payment_id=failure.payment_id,
-        merchant_id=failure.merchant_id,
-        event_type="DIAGNOSIS_COMPLETE",
-        actor=actor,
-        details={"from": old_status, "to": new_status, "reason": reason},
-        failure_id=failure.failure_id,
-    )
+    identifier = UUID(str(failure_id))
+    status = RecoveryStatus(new_status).value
+    if not idempotency_key or len(idempotency_key) > 255:
+        raise ValueError("Idempotency key must contain 1 to 255 characters")
+    result = {"failure_id": str(identifier), "status": status,
+              "actor": actor, "reason": reason}
+    try:
+        failure = db.scalar(
+            select(PaymentFailureEvent)
+            .where(PaymentFailureEvent.failure_id == identifier)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if failure is None:
+            raise ValueError("Failure not found")
+        existing = db.get(IdempotencyKey, idempotency_key)
+        if existing is not None:
+            if (existing.operation_type != "UPDATE_FAILURE_STATUS"
+                    or existing.payment_id != failure.payment_id
+                    or existing.result != result):
+                raise ValueError("Idempotency key conflicts with operation")
+            return
+        record_idempotency_key(
+            db, idempotency_key, failure.payment_id,
+            "UPDATE_FAILURE_STATUS", result,
+        )
+        old_status = failure.status
+        failure.status = status
+        event_type = {
+            "PENDING": "FAILURE_DETECTED",
+            "DIAGNOSED": "DIAGNOSIS_COMPLETE",
+            "CLOSED": "OUTCOME_RECORDED",
+        }.get(status, status)
+        log_audit_event(
+            db,
+            payment_id=failure.payment_id,
+            merchant_id=failure.merchant_id,
+            event_type=event_type,
+            actor=actor,
+            details={"from": old_status, "to": status, "reason": reason,
+                     "operation": "UPDATE_FAILURE_STATUS",
+                     "idempotency_key": idempotency_key},
+            failure_id=failure.failure_id,
+        )
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("Status update failed: %s", type(exc).__name__)
+        raise DatabaseError("Status update failed") from None
+    except Exception:
+        db.rollback()
+        raise
 
 
 def insert_recovery_action(
@@ -334,34 +410,51 @@ def insert_recovery_action(
         DuplicateRecordError: If the idempotency key already exists.
         DatabaseError: If the insert fails.
     """
-    existing = check_idempotency(db, idempotency_key)
-    if existing is not None:
-        raise DuplicateRecordError("IdempotencyKey")
-    action = FailureRecoveryAction(
-        failure_id=UUID(str(failure_id)),
-        payment_id=payment_id,
-        merchant_id=merchant_id,
-        customer_id=customer_id,
-        action_type=action_type,
-        idempotency_key=idempotency_key,
-        config=config,
-        scheduled_at=scheduled_at,
-    )
-    db.add(action)
-    _flush_with_unique_handling(db, action)
-    log_audit_event(
-        db,
-        payment_id=payment_id,
-        merchant_id=merchant_id,
-        event_type="ACTION_EXECUTING",
-        actor="ACTION_EXECUTOR",
-        details={
-            "action_type": action_type,
-            "idempotency_key": idempotency_key,
-        },
-        failure_id=str(failure_id),
-        action_id=action.action_id,
-    )
+    if not idempotency_key or len(idempotency_key) > 255:
+        raise ValueError("Idempotency key must contain 1 to 255 characters")
+    action_type = ActionType(action_type).value
+    try:
+        failure = get_payment_failure_by_id(db, failure_id)
+        if failure is None:
+            raise ValueError("Failure not found")
+        if (failure.payment_id, failure.merchant_id, failure.customer_id) != (
+            payment_id, merchant_id, customer_id
+        ):
+            raise ValueError("Action identifiers do not match failure")
+        existing = check_idempotency(db, idempotency_key)
+        if existing is not None:
+            raise DuplicateRecordError("IdempotencyKey")
+        action = FailureRecoveryAction(
+            failure_id=failure.failure_id,
+            payment_id=payment_id,
+            merchant_id=merchant_id,
+            customer_id=customer_id,
+            action_type=action_type,
+            idempotency_key=idempotency_key,
+            config=config,
+            scheduled_at=scheduled_at,
+        )
+        db.add(action)
+        _flush_with_unique_handling(db, action)
+        log_audit_event(
+            db,
+            payment_id=payment_id,
+            merchant_id=merchant_id,
+            event_type="STRATEGY_SELECTED",
+            actor="ACTION_EXECUTOR",
+            details={"action_type": action_type,
+                     "idempotency_key": idempotency_key,
+                     "operation": "ACTION_CREATED", "status": "PENDING"},
+            failure_id=failure.failure_id,
+            action_id=action.action_id,
+        )
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("Action insertion failed: %s", type(exc).__name__)
+        raise DatabaseError("Action insertion failed") from None
+    except Exception:
+        db.rollback()
+        raise
     return action.action_id
 
 
@@ -377,15 +470,20 @@ def get_recovery_actions_for_failure(
     Returns:
         Actions ordered by creation time.
     """
-    return list(
-        db.scalars(
-            select(FailureRecoveryAction)
-            .where(
-                FailureRecoveryAction.failure_id == UUID(str(failure_id))
+    try:
+        return list(
+            db.scalars(
+                select(FailureRecoveryAction)
+                .where(
+                    FailureRecoveryAction.failure_id == UUID(str(failure_id))
+                )
+                .order_by(FailureRecoveryAction.created_at)
             )
-            .order_by(FailureRecoveryAction.created_at)
         )
-    )
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("Action lookup failed: %s", type(exc).__name__)
+        raise DatabaseError("Action lookup failed") from None
 
 
 def get_merchant_policy(
@@ -400,9 +498,16 @@ def get_merchant_policy(
     Returns:
         The policy or None if not configured.
     """
-    return db.scalar(
-        select(MerchantPolicy).where(MerchantPolicy.merchant_id == merchant_id)
-    )
+    try:
+        return db.scalar(
+            select(MerchantPolicy).where(
+                MerchantPolicy.merchant_id == merchant_id
+            )
+        )
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("Merchant policy lookup failed: %s", type(exc).__name__)
+        raise DatabaseError("Merchant policy lookup failed") from None
 
 
 def update_merchant_policy(
@@ -410,6 +515,8 @@ def update_merchant_policy(
     merchant_id: str,
     updates: dict[str, Any],
     actor: str,
+    *,
+    idempotency_key: str,
 ) -> MerchantPolicy:
     """Update a merchant policy and audit the change.
 
@@ -426,30 +533,49 @@ def update_merchant_policy(
         ValueError: If the policy does not exist.
         DatabaseError: If the update fails.
     """
-    policy = get_merchant_policy(db, merchant_id)
-    if policy is None:
-        raise ValueError(f"Merchant policy not found: {merchant_id}")
-    before = {
-        column: getattr(policy, column)
-        for column in updates
-        if hasattr(policy, column)
+    if not idempotency_key or len(idempotency_key) > 255:
+        raise ValueError("Idempotency key must contain 1 to 255 characters")
+    columns = set(MerchantPolicy.__table__.columns.keys()) - {
+        "policy_id", "merchant_id", "created_at", "updated_at",
     }
-    for column, value in updates.items():
-        if hasattr(policy, column):
+    if not set(updates) <= columns:
+        raise ValueError("Unknown policy column or immutable field")
+    result = {"merchant_id": merchant_id, "updates": updates, "actor": actor}
+    try:
+        policy = db.scalar(
+            select(MerchantPolicy)
+            .where(MerchantPolicy.merchant_id == merchant_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if policy is None:
+            raise ValueError("Merchant policy not found")
+        existing = db.get(IdempotencyKey, idempotency_key)
+        if existing is not None:
+            if (existing.operation_type != "UPDATE_MERCHANT_POLICY"
+                    or existing.result != result):
+                raise ValueError("Idempotency key conflicts with operation")
+            return policy
+        record_idempotency_key(
+            db, idempotency_key, "N/A", "UPDATE_MERCHANT_POLICY", result,
+        )
+        before = {column: getattr(policy, column) for column in updates}
+        for column, value in updates.items():
             setattr(policy, column, value)
-    log_audit_event(
-        db,
-        payment_id="N/A",
-        merchant_id=merchant_id,
-        event_type="OUTCOME_RECORDED",
-        actor=actor,
-        details={
-            "policy_update": {
-                "before": before,
-                "after": updates,
-            },
-        },
-    )
+        log_audit_event(
+            db, payment_id="N/A", merchant_id=merchant_id,
+            event_type="OUTCOME_RECORDED", actor=actor,
+            details={"operation": "UPDATE_MERCHANT_POLICY",
+                     "idempotency_key": idempotency_key,
+                     "policy_update": {"before": before, "after": updates}},
+        )
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("Policy update failed: %s", type(exc).__name__)
+        raise DatabaseError("Policy update failed") from None
+    except Exception:
+        db.rollback()
+        raise
     return policy
 
 
@@ -465,11 +591,16 @@ def get_customer_record(
     Returns:
         The record or None if the customer is new.
     """
-    return db.scalar(
-        select(CustomerRecord).where(
-            CustomerRecord.customer_id == customer_id
+    try:
+        return db.scalar(
+            select(CustomerRecord).where(
+                CustomerRecord.customer_id == customer_id
+            )
         )
-    )
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("Customer lookup failed: %s", type(exc).__name__)
+        raise DatabaseError("Customer lookup failed") from None
 
 
 def record_sms_delivery(
@@ -504,19 +635,41 @@ def record_sms_delivery(
     Raises:
         DatabaseError: If the insert fails.
     """
-    record = SMSDeliveryTracking(
-        action_id=UUID(str(action_id)),
-        payment_id=payment_id,
-        customer_id=customer_id,
-        merchant_id=merchant_id,
-        phone_number=phone_number,
-        message_text=message_text,
-        provider=provider,
-        provider_message_id=provider_message_id,
-        status=status,
-    )
-    db.add(record)
-    _flush_with_unique_handling(db, record)
+    try:
+        action = db.get(FailureRecoveryAction, UUID(str(action_id)))
+        if action is None:
+            raise ValueError("Recovery action not found")
+        if (action.payment_id, action.customer_id, action.merchant_id) != (
+            payment_id, customer_id, merchant_id
+        ):
+            raise ValueError("SMS identifiers do not match recovery action")
+        record = SMSDeliveryTracking(
+            action_id=action.action_id,
+            payment_id=payment_id,
+            customer_id=customer_id,
+            merchant_id=merchant_id,
+            phone_number=phone_number,
+            message_text=message_text,
+            provider=provider,
+            provider_message_id=provider_message_id,
+            status=status,
+        )
+        db.add(record)
+        _flush_with_unique_handling(db, record)
+        log_audit_event(
+            db, payment_id, merchant_id, "OUTCOME_RECORDED",
+            "OUTCOME_TRACKER",
+            {"operation": "SMS_DELIVERY_RECORDED",
+             "sms_id": str(record.sms_id), "status": status},
+            failure_id=action.failure_id, action_id=action.action_id,
+        )
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("SMS recording failed: %s", type(exc).__name__)
+        raise DatabaseError("SMS recording failed") from None
+    except Exception:
+        db.rollback()
+        raise
     return record.sms_id
 
 
@@ -528,11 +681,13 @@ def record_outcome(
     success: bool,
     details: dict[str, Any],
     action_id: UUID | str | None = None,
+    *,
+    idempotency_key: str,
+    new_status: RecoveryStatus | str | None = None,
 ) -> UUID:
-    """Insert an outcome record and update the failure status.
+    """Insert an outcome and optionally apply a caller-supplied status.
 
-    Runs in one transaction: outcome insert plus status transition
-    (ACTION_SUCCESS when success, else ACTION_FAILED), each audited.
+    Outcome, explicit status, audit and idempotency key share a transaction.
 
     Args:
         db: Database session.
@@ -550,35 +705,68 @@ def record_outcome(
         ValueError: If the failure does not exist.
         DatabaseError: If the insert fails.
     """
-    failure = get_payment_failure_by_id(db, failure_id)
-    if failure is None:
-        raise ValueError(f"Failure not found: {failure_id}")
-    outcome = OutcomeRecord(
-        payment_id=payment_id,
-        failure_id=UUID(str(failure_id)),
-        action_id=UUID(str(action_id)) if action_id else None,
-        merchant_id=failure.merchant_id,
-        outcome_type=outcome_type,
-        success=success,
-        details=details,
+    identifier = UUID(str(failure_id))
+    action_identifier = UUID(str(action_id)) if action_id else None
+    status = (
+        RecoveryStatus(new_status).value if new_status is not None else None
     )
-    db.add(outcome)
-    _flush_with_unique_handling(db, outcome)
-    new_status = "ACTION_SUCCESS" if success else "ACTION_FAILED"
-    log_audit_event(
-        db,
-        payment_id=payment_id,
-        merchant_id=failure.merchant_id,
-        event_type="OUTCOME_RECORDED",
-        actor="OUTCOME_TRACKER",
-        details={
-            "outcome_type": outcome_type,
-            "success": success,
-        },
-        failure_id=failure.failure_id,
-        action_id=str(action_id) if action_id else None,
-    )
-    failure.status = new_status
+    if not idempotency_key or len(idempotency_key) > 255:
+        raise ValueError("Idempotency key must contain 1 to 255 characters")
+    request = {
+        "failure_id": str(identifier), "payment_id": payment_id,
+        "action_id": str(action_identifier) if action_identifier else None,
+        "outcome_type": outcome_type, "success": success,
+        "details": details, "new_status": status,
+    }
+    try:
+        failure = db.scalar(
+            select(PaymentFailureEvent)
+            .where(PaymentFailureEvent.failure_id == identifier)
+            .with_for_update().execution_options(populate_existing=True)
+        )
+        if failure is None:
+            raise ValueError("Failure not found")
+        if failure.payment_id != payment_id:
+            raise ValueError("Payment does not match failure")
+        if action_identifier is not None:
+            action = db.get(FailureRecoveryAction, action_identifier)
+            if action is None or action.failure_id != identifier:
+                raise ValueError("Action does not match failure")
+        existing = db.get(IdempotencyKey, idempotency_key)
+        if existing is not None:
+            if (existing.operation_type != "RECORD_OUTCOME"
+                    or existing.result.get("request") != request):
+                raise ValueError("Idempotency key conflicts with operation")
+            return UUID(existing.result["outcome_id"])
+        outcome = OutcomeRecord(
+            payment_id=payment_id, failure_id=identifier,
+            action_id=action_identifier, merchant_id=failure.merchant_id,
+            outcome_type=outcome_type, success=success, details=details,
+        )
+        db.add(outcome)
+        _flush_with_unique_handling(db, outcome)
+        record_idempotency_key(
+            db, idempotency_key, payment_id, "RECORD_OUTCOME",
+            {"request": request, "outcome_id": str(outcome.outcome_id)},
+        )
+        old_status = failure.status
+        if status is not None:
+            failure.status = status
+        log_audit_event(
+            db, payment_id, failure.merchant_id, "OUTCOME_RECORDED",
+            "OUTCOME_TRACKER",
+            {"outcome_id": str(outcome.outcome_id),
+             "outcome_type": outcome_type, "success": success,
+             "from": old_status, "to": failure.status},
+            failure_id=identifier, action_id=action_identifier,
+        )
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("Outcome recording failed: %s", type(exc).__name__)
+        raise DatabaseError("Outcome recording failed") from None
+    except Exception:
+        db.rollback()
+        raise
     return outcome.outcome_id
 
 
